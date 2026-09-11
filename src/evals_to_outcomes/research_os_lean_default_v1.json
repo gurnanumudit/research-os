@@ -1,0 +1,44 @@
+{
+  "checkpoint_policy": {
+    "fallback_rule": "RECORD_AND_CONTINUE_IF_PROSPECTIVELY_ALLOWED_ELSE_CLOSE_CHECKPOINT",
+    "max_bounded_repair_batches": 1,
+    "operational_issue_kinds": [
+      "MISSING_CREDENTIAL",
+      "TRANSPORT_FAILURE",
+      "PROVIDER_SCHEMA_FAILURE",
+      "ENVIRONMENT_FAILURE",
+      "FORMATTING_METADATA_FAILURE"
+    ],
+    "owner_decision_issue_kinds": [
+      "SCIENTIFIC_SCOPE_CHANGE",
+      "CLAIM_CHANGE",
+      "NEW_COST",
+      "SECURITY_PRIVACY_CHANGE",
+      "UNSAFE_AMBIGUITY"
+    ]
+  },
+  "default_for_new_studies": true,
+  "mandatory_scientific_core": [
+    "PROSPECTIVE_PROTOCOL",
+    "DATA_IDENTITY_LINEAGE",
+    "LABEL_BLINDING",
+    "SCORER_VALIDATION",
+    "BUDGET_CAP",
+    "APPEND_ONLY_ATTEMPT_LOG",
+    "DATASET_COMPLETENESS",
+    "REPRODUCIBLE_ANALYSIS"
+  ],
+  "optional_high_assurance": {
+    "available": [
+      "PER_TRANSITION_INDEPENDENT_AUDIT",
+      "IMMUTABLE_INTERMEDIATE_PERMISSIONS",
+      "MULTIPLE_GO_RECEIPTS",
+      "INJECTED_FAULT_SUITE",
+      "CRASH_CUSTODY_CEREMONY",
+      "ROOT_ONLY_RELEASE_FILES"
+    ],
+    "enabled_by_default": []
+  },
+  "profile_id": "lean-default-v1",
+  "schema_version": "research-os-lean-profile-v1"
+}
