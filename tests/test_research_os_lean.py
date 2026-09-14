@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -132,6 +134,7 @@ def test_simple_attempt_log_reconciles_complete_dataset_and_budget(tmp_path: Pat
         attempt_id="attempt-a",
         request_sha256=REQUEST_A,
         reserved_cost_usd="0.30",
+        budget_cap_usd="1",
         recorded_at="2026-09-10T01:00:00Z",
     )
     append_attempt_terminal(
@@ -165,6 +168,7 @@ def test_pre_provider_failure_can_use_a_fresh_repair_identity(tmp_path: Path) ->
         attempt_id="attempt-original",
         request_sha256=REQUEST_A,
         reserved_cost_usd="0.30",
+        budget_cap_usd="1",
         recorded_at="2026-09-10T01:00:00Z",
     )
     append_attempt_terminal(
@@ -184,6 +188,7 @@ def test_pre_provider_failure_can_use_a_fresh_repair_identity(tmp_path: Path) ->
         attempt_id="attempt-repair-1",
         request_sha256=REQUEST_B,
         reserved_cost_usd="0.30",
+        budget_cap_usd="1",
         recorded_at="2026-09-10T01:02:00Z",
     )
     append_attempt_terminal(
@@ -214,6 +219,7 @@ def test_attempt_identity_and_terminal_are_single_use(tmp_path: Path) -> None:
         "attempt_id": "attempt-a",
         "request_sha256": REQUEST_A,
         "reserved_cost_usd": "0.2",
+        "budget_cap_usd": "1",
         "recorded_at": "2026-09-10T01:00:00Z",
     }
     append_attempt_intent(log, **kwargs)
@@ -243,6 +249,7 @@ def test_mismatched_terminal_request_is_rejected_before_append(tmp_path: Path) -
         attempt_id="attempt-a",
         request_sha256=REQUEST_A,
         reserved_cost_usd="0.2",
+        budget_cap_usd="1",
         recorded_at="2026-09-10T01:00:00Z",
     )
     with pytest.raises(LeanProfileError, match="request identity differs"):
@@ -268,6 +275,7 @@ def test_ambiguous_external_outcome_is_preserved_but_not_analysis_ready(tmp_path
         attempt_id="attempt-a",
         request_sha256=REQUEST_A,
         reserved_cost_usd="0.4",
+        budget_cap_usd="1",
         recorded_at="2026-09-10T01:00:00Z",
     )
     append_attempt_terminal(
@@ -282,17 +290,31 @@ def test_ambiguous_external_outcome_is_preserved_but_not_analysis_ready(tmp_path
         exclusion_reason="dispatch occurrence cannot be determined",
         recorded_at="2026-09-10T01:01:00Z",
     )
-    reconciliation = reconcile_attempts(
-        log, planned_attempt_ids=["attempt-a"], budget_cap_usd="1"
-    )
+    reconciliation = reconcile_attempts(log, planned_attempt_ids=["attempt-a"], budget_cap_usd="1")
     assert reconciliation["dataset_complete"] is True
     assert reconciliation["ambiguous_attempt_ids"] == ["attempt-a"]
     assert reconciliation["analysis_ready"] is False
 
 
 def test_budget_admission_and_reservation_overrun(tmp_path: Path) -> None:
-    assert budget_allows(cap_usd="2", observed_usd="0.5", proposed_max_usd="1.5") is True
-    assert budget_allows(cap_usd="2", observed_usd="0.5001", proposed_max_usd="1.5") is False
+    assert (
+        budget_allows(
+            cap_usd="2", observed_usd="0.5", outstanding_reserved_usd="0", proposed_max_usd="1.5"
+        )
+        is True
+    )
+    assert (
+        budget_allows(
+            cap_usd="2", observed_usd="0.5001", outstanding_reserved_usd="0", proposed_max_usd="1.5"
+        )
+        is False
+    )
+    assert (
+        budget_allows(
+            cap_usd="2", observed_usd="0.5", outstanding_reserved_usd="0.1", proposed_max_usd="1.5"
+        )
+        is False
+    )
 
     log = tmp_path / "attempts.jsonl"
     append_attempt_intent(
@@ -300,6 +322,7 @@ def test_budget_admission_and_reservation_overrun(tmp_path: Path) -> None:
         attempt_id="attempt-a",
         request_sha256=REQUEST_A,
         reserved_cost_usd="0.1",
+        budget_cap_usd="1",
         recorded_at="2026-09-10T01:00:00Z",
     )
     append_attempt_terminal(
@@ -314,8 +337,100 @@ def test_budget_admission_and_reservation_overrun(tmp_path: Path) -> None:
         exclusion_reason=None,
         recorded_at="2026-09-10T01:01:00Z",
     )
-    reconciliation = reconcile_attempts(
-        log, planned_attempt_ids=["attempt-a"], budget_cap_usd="1"
-    )
+    reconciliation = reconcile_attempts(log, planned_attempt_ids=["attempt-a"], budget_cap_usd="1")
     assert reconciliation["reservation_exceeded_attempt_ids"] == ["attempt-a"]
     assert reconciliation["analysis_ready"] is False
+
+
+def test_atomic_admission_counts_concurrent_reservations(tmp_path: Path) -> None:
+    log = tmp_path / "attempts.jsonl"
+    barrier = Barrier(2)
+
+    def reserve(attempt: str) -> bool:
+        barrier.wait()
+        try:
+            append_attempt_intent(
+                log,
+                attempt_id=attempt,
+                request_sha256=REQUEST_A,
+                reserved_cost_usd="0.6",
+                budget_cap_usd="1",
+                recorded_at="now",
+            )
+        except LeanProfileError as error:
+            assert "budget cap" in str(error)
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(reserve, ["a", "b"])) == [False, True]
+    assert len(read_attempt_log(log)) == 1
+
+
+@pytest.mark.parametrize("cost,outstanding", [("0", "0.8"), ("0.2", "0.6"), ("1", "0")])
+def test_unknown_terminal_keeps_unsettled_exposure(
+    tmp_path: Path, cost: str, outstanding: str
+) -> None:
+    log = tmp_path / "attempts.jsonl"
+    append_attempt_intent(
+        log,
+        attempt_id="a",
+        request_sha256=REQUEST_A,
+        reserved_cost_usd="0.8",
+        budget_cap_usd="1",
+        recorded_at="now",
+    )
+    append_attempt_terminal(
+        log,
+        attempt_id="a",
+        request_sha256=REQUEST_A,
+        outcome="UNKNOWN_EXTERNAL_OUTCOME",
+        provider_contacted=None,
+        raw_response_sha256=None,
+        observed_cost_usd=cost,
+        included=False,
+        exclusion_reason="dispatch uncertain",
+        recorded_at="later",
+    )
+    report = reconcile_attempts(log, planned_attempt_ids=["a"], budget_cap_usd="1")
+    assert report["outstanding_reserved_usd"] == outstanding
+    assert report["analysis_ready"] is False
+    with pytest.raises(LeanProfileError, match="budget cap"):
+        append_attempt_intent(
+            log,
+            attempt_id="b",
+            request_sha256=REQUEST_B,
+            reserved_cost_usd="0.3",
+            budget_cap_usd="1",
+            recorded_at="later",
+        )
+    assert len(read_attempt_log(log)) == 2
+
+
+def test_local_included_success_requires_evidence(tmp_path: Path) -> None:
+    log = tmp_path / "attempts.jsonl"
+    append_attempt_intent(
+        log,
+        attempt_id="a",
+        request_sha256=REQUEST_A,
+        reserved_cost_usd="0",
+        budget_cap_usd="0",
+        recorded_at="now",
+    )
+    terminal = {
+        "attempt_id": "a",
+        "request_sha256": REQUEST_A,
+        "outcome": "SUCCESS",
+        "provider_contacted": False,
+        "raw_response_sha256": None,
+        "observed_cost_usd": "0",
+        "included": True,
+        "exclusion_reason": None,
+        "recorded_at": "later",
+    }
+    with pytest.raises(LeanProfileError, match="included success requires"):
+        append_attempt_terminal(log, **terminal)
+    assert len(read_attempt_log(log)) == 1
+    terminal["raw_response_sha256"] = RAW_A
+    append_attempt_terminal(log, **terminal)
+    assert reconcile_attempts(log, planned_attempt_ids=["a"], budget_cap_usd="0")["analysis_ready"]

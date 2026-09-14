@@ -3,6 +3,10 @@
 Recorded: 2026-09-09  
 Status: Core operating principle for prospective Research OS and study work
 
+These are research-program principles, not guarantees supplied by the standalone Python package.
+The [integration guide](lean-default-design.md) distinguishes implemented checks from study-owned
+controls. The 15% overhead target below is an operating aspiration, not a measured package result.
+
 ## Core principle
 
 Research OS exists to make scientific learning trustworthy **and faster**. It must protect

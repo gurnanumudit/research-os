@@ -1,8 +1,8 @@
 """Small reusable primitives for the Research OS lean-default profile.
 
-The module intentionally does not duplicate the scientific validators in Research OS Track A or
-Track B. It supplies only profile validation, checkpoint routing, a compact attempt ledger, budget
-admission, and completeness reconciliation. The preserved CP3 high-assurance runtime is unchanged.
+This standalone package supplies profile validation, checkpoint routing, a compact attempt ledger,
+atomic budget admission, and completeness reconciliation. Study-specific scientific validation,
+provider dispatch, evidence storage, and analysis remain the caller's responsibility.
 """
 
 from __future__ import annotations
@@ -263,13 +263,15 @@ def _validate_row(row: Any, expected_sequence: int) -> dict[str, Any]:
         raise LeanProfileError("exclusion_reason must be null or bounded text")
     if row["included"] and (row["outcome"] != "SUCCESS" or reason is not None):
         raise LeanProfileError("only a successful terminal without an exclusion may be included")
+    if row["included"] and raw_sha is None:
+        raise LeanProfileError(
+            "included success requires raw response identity, including local work"
+        )
     if not row["included"] and reason is None:
         raise LeanProfileError("excluded terminal requires a reason")
     if row["provider_contacted"] is True and raw_sha is None:
         raise LeanProfileError("provider contact requires raw response identity")
-    if (row["outcome"] == "UNKNOWN_EXTERNAL_OUTCOME") != (
-        row["provider_contacted"] is None
-    ):
+    if (row["outcome"] == "UNKNOWN_EXTERNAL_OUTCOME") != (row["provider_contacted"] is None):
         raise LeanProfileError("unknown external outcome and provider status disagree")
     return row
 
@@ -348,18 +350,26 @@ def append_attempt_intent(
     attempt_id: str,
     request_sha256: str,
     reserved_cost_usd: str,
+    budget_cap_usd: str,
     recorded_at: str,
 ) -> dict[str, Any]:
-    """Append the only allowed intent for an attempt identity."""
+    """Atomically admit and reserve an attempt against this log's cumulative exposure cap.
+
+    All writers must use the same approved cap and log. Dispatch only after this returns.
+    """
 
     _identifier(attempt_id, "attempt_id")
     _sha256(request_sha256, "request_sha256")
-    _decimal(reserved_cost_usd, "reserved_cost_usd")
+    proposed = _decimal(reserved_cost_usd, "reserved_cost_usd")
+    cap = _decimal(budget_cap_usd, "budget_cap_usd")
     _recorded_at(recorded_at)
 
     def build(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if any(row["attempt_id"] == attempt_id for row in rows):
             raise LeanProfileError("attempt identity was already used")
+        observed, outstanding = _exposure(rows)
+        if observed + outstanding + proposed > cap:
+            raise LeanProfileError("attempt reservation exceeds the cumulative budget cap")
         return {
             "schema_version": "research-os-lean-attempt-event-v1",
             "sequence": len(rows) + 1,
@@ -419,12 +429,35 @@ def append_attempt_terminal(
     return _locked_append(path, build)
 
 
-def budget_allows(*, cap_usd: str, observed_usd: str, proposed_max_usd: str) -> bool:
-    """Return whether settled cost plus a proposed maximum fits the current checkpoint cap."""
+def budget_allows(
+    *, cap_usd: str, observed_usd: str, outstanding_reserved_usd: str, proposed_max_usd: str
+) -> bool:
+    """Advisory arithmetic only; use append_attempt_intent for atomic admission."""
 
     return _decimal(observed_usd, "observed_usd") + _decimal(
-        proposed_max_usd, "proposed_max_usd"
-    ) <= _decimal(cap_usd, "cap_usd")
+        outstanding_reserved_usd, "outstanding_reserved_usd"
+    ) + _decimal(proposed_max_usd, "proposed_max_usd") <= _decimal(cap_usd, "cap_usd")
+
+
+def _exposure(rows: Iterable[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+    intents = {}
+    terminals = {}
+    for row in rows:
+        (intents if row["event"] == "INTENT" else terminals)[row["attempt_id"]] = row
+    observed = Decimal(0)
+    outstanding = Decimal(0)
+    for attempt_id, intent in intents.items():
+        reserved = _decimal(intent["reserved_cost_usd"], "reserved_cost_usd")
+        terminal = terminals.get(attempt_id)
+        if terminal is None:
+            outstanding += reserved
+            continue
+        cost = _decimal(terminal["observed_cost_usd"], "observed_cost_usd")
+        observed += cost
+        if terminal["outcome"] == "UNKNOWN_EXTERNAL_OUTCOME":
+            # Known charges are part of, not additional to, the reserved maximum.
+            outstanding += max(reserved - cost, Decimal(0))
+    return observed, outstanding
 
 
 def reconcile_attempts(
@@ -448,18 +481,7 @@ def reconcile_attempts(
     if unknown_ids:
         raise LeanProfileError("attempt log contains an unplanned identity")
 
-    spend = sum(
-        (_decimal(row["observed_cost_usd"], "observed_cost_usd") for row in terminals.values()),
-        start=Decimal(0),
-    )
-    outstanding = sum(
-        (
-            _decimal(row["reserved_cost_usd"], "reserved_cost_usd")
-            for attempt_id, row in intents.items()
-            if attempt_id not in terminals
-        ),
-        start=Decimal(0),
-    )
+    spend, outstanding = _exposure(rows)
     reservation_exceeded = sorted(
         attempt_id
         for attempt_id, terminal in terminals.items()
